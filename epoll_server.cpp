@@ -8,11 +8,59 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <unordered_map>
+#include <vector>
 
 #define PORT "5050"
 #define LISTEN_BACKLOG 10
 #define MAX_EVENTS 10
 #define BUF_SIZE 4096
+
+struct ConnectionState {
+    std::vector<char> write_buf;
+    std::size_t write_offset;
+};
+
+void fanout(int epollfd, int senderFd, std::unordered_map<int, ConnectionState>& clients, char* buf, ssize_t val) {
+    struct epoll_event ev;
+    std::vector<int> clientsToErase;
+    for (auto& [clientFd, connectionState] : clients) {
+        if (clientFd != senderFd) {
+            auto& write_buf = connectionState.write_buf;
+            if (!write_buf.empty()) {
+                write_buf.insert(write_buf.end(), buf, buf + val);
+
+            } else {
+                ssize_t sent = send(clientFd, buf, val, 0);
+                if (sent == val) {
+                    write_buf.clear();
+                    connectionState.write_offset = 0;
+                }
+                else if (sent >= 0) {
+                    connectionState.write_offset = 0;
+                    write_buf.insert(write_buf.end(), buf + sent, buf + val);
+                    ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+                    ev.data.fd = clientFd;
+                    epoll_ctl(epollfd, EPOLL_CTL_MOD, clientFd, &ev);
+                } else if (errno == EAGAIN) {
+                    connectionState.write_offset = 0;
+                    write_buf.insert(write_buf.end(), buf, buf + val);
+                    ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+                    ev.data.fd = clientFd;
+                    epoll_ctl(epollfd, EPOLL_CTL_MOD, clientFd, &ev);
+                } else {
+                    printf("REAL ERROR\n");
+                    epoll_ctl(epollfd, EPOLL_CTL_DEL, clientFd, NULL);
+                    close(clientFd);
+                    clientsToErase.push_back(clientFd);
+                    continue;
+                }
+
+            }
+        }
+    }
+    for (int clientFd : clientsToErase) clients.erase(clientFd);
+}
 
 int main() {
     int fd, nfds, conn_sock;
@@ -21,6 +69,8 @@ int main() {
     struct addrinfo *results, *rp;
     socklen_t peer_addr_size;
     struct sockaddr_storage peer_addr;
+
+    std::unordered_map<int, ConnectionState> clients;
 
     std::memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -109,25 +159,49 @@ int main() {
                     close(conn_sock);
                     continue;
                 }
+                clients[conn_sock];
             } else {
-                while (1) {
-                    ssize_t val = recv(events[n].data.fd, buf, sizeof(buf) - 1, 0);
-                    if (val > 0) {
-                        buf[val] = '\0';
-                        printf("%s", buf);
-                    } else if (val == 0) {
-                        printf("Client closed the connection\n");
-                        epoll_ctl(epollfd, EPOLL_CTL_DEL, events[n].data.fd, NULL);
-                        close(events[n].data.fd);
-                        break;
-                    } else if (errno == EAGAIN) {
-                        printf("Buffer drained\n");
-                        break;
-                    } else {
+                if (events[n].events & EPOLLOUT) {
+                    auto& write_buf = clients[events[n].data.fd].write_buf;
+                    auto& write_offset = clients[events[n].data.fd].write_offset;
+                    ssize_t sent = send(events[n].data.fd, write_buf.data() + write_offset, write_buf.size() - write_offset, 0);
+                    if (sent > 0) write_offset += sent;
+                    if (write_offset == write_buf.size()) {
+                        write_buf.clear();
+                        write_offset = 0;
+                        ev.events = EPOLLIN | EPOLLET;
+                        ev.data.fd = events[n].data.fd;
+                        epoll_ctl(epollfd, EPOLL_CTL_MOD, events[n].data.fd, &ev);
+                    } else if (sent < 0 && errno != EAGAIN) {
                         printf("REAL ERROR\n");
                         epoll_ctl(epollfd, EPOLL_CTL_DEL, events[n].data.fd, NULL);
                         close(events[n].data.fd);
-                        break;
+                        clients.erase(events[n].data.fd);
+                        continue;
+                    }
+                } if (events[n].events & EPOLLIN) {
+                    while (1) {
+                        ssize_t val = recv(events[n].data.fd, buf, sizeof(buf) - 1, 0);
+                        if (val > 0) {
+                            buf[val] = '\0';
+                            fanout(epollfd, events[n].data.fd, clients, buf, val);
+                            printf("%s", buf);
+                        } else if (val == 0) {
+                            printf("Client closed the connection\n");
+                            epoll_ctl(epollfd, EPOLL_CTL_DEL, events[n].data.fd, NULL);
+                            close(events[n].data.fd);
+                            clients.erase(events[n].data.fd);
+                            break;
+                        } else if (errno == EAGAIN) {
+                            printf("Buffer drained\n");
+                            break;
+                        } else {
+                            printf("REAL ERROR\n");
+                            epoll_ctl(epollfd, EPOLL_CTL_DEL, events[n].data.fd, NULL);
+                            close(events[n].data.fd);
+                            clients.erase(events[n].data.fd);
+                            break;
+                        }
                     }
                 }
             }
