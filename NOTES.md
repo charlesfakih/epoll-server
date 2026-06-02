@@ -38,3 +38,11 @@ Other observations:
 - SO_REUSEADDR must be set before bind() to avoid the "Address already in use" error on the socket.
 
 Limitation of the current state: The server prints to stdout. The clients themselves get nothing back. That's where fan-out steps in. We'll have to write code for the client in order to handle whatever is sent back to it. I wonder if we can do this efficiently with Socket Streams at scale if we don't have access to broadcast. What about partial writes?
+
+-----------------------------------------------------------------
+
+Adding fan-out strategy to the epoll-server requires deciding how to deal with the issue of partial writes, as send(...) is not guaranteed to send the entire buffer to each client, as the kernel's send buffer can be full. To ensure consistency between what every client sees, including ordering, we have set out to store a write buffer and the offset it's reached whenever for every client (std::unordered_map in C++) whenever the server has not sent to the client all its destined data. Whenever the server has sent everything destined to it, the write buffer is cleared. Separately, we must also append any new messages to the unsent part of the old message in order to preserve ordering.
+
+Interesting here is the role of the EPOLLOUT flag that we add as a tracked event to file descriptors to whom we sent partial data.  That way, the epoll_wait can return them as ready to perform another send(...) to, and we just handle them in the loop of the ready list. There, the write buffer that we computed upon the original partial write comes in handy, as we can perform a send with that data and only disarm the EPOLLOUT flag whenever the full buffer has been consumed, otherwise let it continue to fire an event.
+
+A C++ issue that I was attentive to here was to not erase the key of the clients unordered_map while iterating through it. That would cause the infamous iterator invalidation for the rest of the loop. Instead, I kept track of the deleted keys inside a new vector, and after the loop exit, I deleted the fd's in a standalone small loop.
