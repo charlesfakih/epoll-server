@@ -49,7 +49,7 @@ void fanout(int epollfd, int senderFd, std::unordered_map<int, ConnectionState>&
                     ev.data.fd = clientFd;
                     epoll_ctl(epollfd, EPOLL_CTL_MOD, clientFd, &ev);
                 } else {
-                    printf("REAL ERROR\n");
+                    //printf("REAL ERROR\n");
                     epoll_ctl(epollfd, EPOLL_CTL_DEL, clientFd, NULL);
                     close(clientFd);
                     clientsToErase.push_back(clientFd);
@@ -59,7 +59,8 @@ void fanout(int epollfd, int senderFd, std::unordered_map<int, ConnectionState>&
             }
         }
     }
-    for (int clientFd : clientsToErase) clients.erase(clientFd);
+    for (int clientFd : clientsToErase
+    ) clients.erase(clientFd);
 }
 
 int main() {
@@ -173,7 +174,7 @@ int main() {
                         ev.data.fd = events[n].data.fd;
                         epoll_ctl(epollfd, EPOLL_CTL_MOD, events[n].data.fd, &ev);
                     } else if (sent < 0 && errno != EAGAIN) {
-                        printf("REAL ERROR\n");
+                        //printf("REAL ERROR\n");
                         epoll_ctl(epollfd, EPOLL_CTL_DEL, events[n].data.fd, NULL);
                         close(events[n].data.fd);
                         clients.erase(events[n].data.fd);
@@ -185,18 +186,18 @@ int main() {
                         if (val > 0) {
                             buf[val] = '\0';
                             fanout(epollfd, events[n].data.fd, clients, buf, val);
-                            printf("%s", buf);
+                            //printf("%s", buf);
                         } else if (val == 0) {
-                            printf("Client closed the connection\n");
+                            //printf("Client closed the connection\n");
                             epoll_ctl(epollfd, EPOLL_CTL_DEL, events[n].data.fd, NULL);
                             close(events[n].data.fd);
                             clients.erase(events[n].data.fd);
                             break;
                         } else if (errno == EAGAIN) {
-                            printf("Buffer drained\n");
+                            //printf("Buffer drained\n");
                             break;
                         } else {
-                            printf("REAL ERROR\n");
+                            //printf("REAL ERROR\n");
                             epoll_ctl(epollfd, EPOLL_CTL_DEL, events[n].data.fd, NULL);
                             close(events[n].data.fd);
                             clients.erase(events[n].data.fd);
