@@ -46,3 +46,49 @@ Adding fan-out strategy to the epoll-server requires deciding how to deal with t
 Interesting here is the role of the EPOLLOUT flag that we add as a tracked event to file descriptors to whom we sent partial data.  That way, the epoll_wait can return them as ready to perform another send(...) to, and we just handle them in the loop of the ready list. There, the write buffer that we computed upon the original partial write comes in handy, as we can perform a send with that data and only disarm the EPOLLOUT flag whenever the full buffer has been consumed, otherwise let it continue to fire an event.
 
 A C++ issue that I was attentive to here was to not erase the key of the clients unordered_map while iterating through it. That would cause the infamous iterator invalidation for the rest of the loop. Instead, I kept track of the deleted keys inside a new vector, and after the loop exit, I deleted the fd's in a standalone small loop.
+
+
+------------------------------------------------------------------------
+
+June 2nd
+
+I wrote a client and here are a few observations:
+
+- connect(...) is the client intiating while a server waits with accept(...). No need for bind(...) or listen(...) call here, since this is not a server.
+
+- The Message struct embeds the seq and timestamp_ns in the payload so the receiver can compute latency easily. Fixed-size messages avoid framing and adding any other size logic. Length is data here.
+
+- We used memcpy(...) to copy the buffer's raw bytes into the Message struct, in order to respect the strict aliasing rules we would have broken with reinterpret_cast. Even though it works in practice, casting a buffer pointer to anything not char* or byte* is UB because the compiler operates with the assumption that this does not happen and thus freely optimizes the code based on that assumption.
+
+- To measure time, we used clock_gettime(CLOCK_MONOTONIC) as it gives one-directional time guarantee insulated from the NTP jumps of a wall clocks. Its resolution is at the nanosecond level. Ideal for latency calculations.
+
+- In the loop, send(...) must be positioned before epoll_wait(...) as no events are fired until the client has sent a message.
+
+- Curiously, timeout=0 gave worse latency than timeout=10. This means the send rate without timeout outpaced the fan-out processing, messages backlogged and queuing delay dominated.
+
+- Here, the client and server are on the same machine. This is a benchmark environment limitation, since they both share CPU and loopback stack and thus compute for resources. Real benchmarks need separate machines.
+
+-----------------------------------------------------------------
+
+Profiling:
+
+- If task-clock is 10% of wall clock, the process was sleeping 90% of the time. CPUs utilized is derived from this. IPC tells you how efficiently the CPU worked when it was running. Low IPC means stalling on memory or not doing much compute, but with 7% utilization and mostly sleeping, this number is not very meaningful. Effective GHz very low = process sleeping frequently. The branch misses % was elevated but the absolute numbers are small enough for it to not be a meaningful bottleneck at this load. The if/else chains in the event loop dispatch are perhaps not predictable to the CPU because it depends on which fd happens to be ready.
+
+Flamegraph:
+
+First flamegraph showed printf dominating even with "no printfs". Stale binary, didn't rebuild. Always rebuild before profiling. You have to be selective about what commenting out, you remove the prints from your hot path. The error handling is a cold path that you don't need to clear for profiling.
+
+After removing printf, __memmove_avx_unaligned_erms dominated. It comes from write_buf.insert(...) in fanout copying message bytes into the per-connection vector for every recipient. There was also a second significant box, the __send syscall overhead.
+
+One proposed fix: reference-counted shared buffers: one copy per message. Each client would hold a pointer and offset. Something similar to shared_ptr but without the atomic overhead.
+
+Latency and throughput:
+
+timeout=0 gave 3ms latency vs sub-millisecond at timeout = 10
+The reason is that in the former, the send rate outpaced the fan-out processing, so the whole chain of send buffer, recv buffer, etc. build up and latency explodes.
+
+Latency (duration) and throughput (messages/second) are different units and measure different things. When you're at a load level that is below the "knee of the curve", latency is stable and throughput increases. Above it, the queues back up and latency explodes (as we have seen with the 0 timeout that is assuredly above the knee).
+
+In a real messaging system, measuring p50/p99/p999 is essential. Relying on the average is misleading, it tells you nothing about how the latency is distributed statistically. The average case can have low latency but the occasional spike affects the user-experience as well. For a messaging system, we track the p999 to account for the worst-case user experience.
+
+Again, the limitation here is that client and server are on the same machine. They share CPU and loopback stack. Real benchmarks need separate machines.
